@@ -1,0 +1,213 @@
+import pandas as pd
+import plotly.express as px
+from dash import Dash, dcc, html, Input, Output, callback_context
+
+# Load the emissions dataset. Adjust the path if needed.
+df = pd.read_csv('owid-co2-data.csv')
+
+# Filter out records before 1973 to ignore earlier years.
+df = df[df['year'] >= 1973]
+
+# Verify that the required columns are present.
+if 'year' not in df.columns or 'country' not in df.columns:
+    raise ValueError("The dataset must contain 'year' and 'country' columns.")
+
+# Determine the year range.
+min_year = int(df['year'].min())  # Now starts at 1973
+max_year = int(df['year'].max())
+
+# Create a sorted list of unique countries.
+countries = sorted(df['country'].dropna().unique())
+
+# Define emission columns.
+# This example selects all columns containing "co2", excluding those with "per_capita".
+emission_columns = [
+    col for col in df.columns
+    if 'co2' in col.lower() and 'per_capita' not in col.lower()
+]
+
+if not emission_columns:
+    raise ValueError("No emission columns found. Please check your dataset column names.")
+
+print("Emission columns available:", emission_columns)
+
+# Prepare dropdown options with an extra "ALL" option at the top.
+country_options = [{'label': "All Countries", 'value': 'ALL'}] + \
+                  [{'label': country, 'value': country} for country in countries]
+
+emission_options = [{'label': "All Emissions", 'value': 'ALL'}] + \
+                   [{'label': col, 'value': col} for col in emission_columns]
+
+# Build marks dictionary ensuring both endpoints are included.
+marks = {year: str(year) for year in range(min_year, max_year + 1, 5)}
+marks = {year: str(year) for year in sorted(set(marks.keys()).union({min_year, max_year}))}
+
+# Initialize the Dash app.
+app = Dash(__name__)
+server = app.server  # Useful for deployment if needed.
+
+app.layout = html.Div([
+    # Countries and Emissions dropdowns above the graph.
+    html.Div([
+        html.Div([
+            html.Label("Select Countries:"),
+            dcc.Dropdown(
+                id='country-dropdown',
+                options=country_options,
+                value=['ALL'],  # Default: only "All Countries" is selected.
+                multi=True
+            )
+        ], style={'width': '45%', 'padding': '20px', 'display': 'inline-block'}),
+
+        html.Div([
+            html.Label("Select Emission Types:"),
+            dcc.Dropdown(
+                id='emission-dropdown',
+                options=emission_options,
+                value=['ALL'],  # Default: only "All Emissions" is selected.
+                multi=True
+            )
+        ], style={'width': '45%', 'padding': '20px', 'display': 'inline-block', 'float': 'right'})
+    ], style={'width': '80%', 'margin': 'auto'}),
+
+    # Graph in the middle.
+    dcc.Graph(id='emission-graph', style={'height': '800px'}),
+
+    # Year range slider below the graph.
+    html.Div([
+        html.Label("Select Year Range:"),
+        dcc.RangeSlider(
+            id='year-slider',
+            min=min_year,
+            max=max_year,
+            value=[min_year, max_year],  # Default: full range (1973 onward)
+            step=1,
+            marks=marks,
+            tooltip={"placement": "bottom", "always_visible": True}
+        )
+    ], style={
+        'width': 'calc(100% - 60px)',  # Full width minus 60px adjustment.
+        'padding': '20px',
+        'margin-left': '0px',
+        'margin-right': '60px'         # 60px gap on the right side.
+    }),
+
+    # Hidden Stores to keep track of the previous selections.
+    dcc.Store(id='country-store', data=['ALL']),
+    dcc.Store(id='emission-store', data=['ALL'])
+])
+
+# Main callback to update the line graph.
+@app.callback(
+    Output('emission-graph', 'figure'),
+    Input('year-slider', 'value'),
+    Input('country-dropdown', 'value'),
+    Input('emission-dropdown', 'value')
+)
+def update_graph(selected_year_range, selected_countries, selected_emissions):
+    start_year, end_year = selected_year_range
+
+    # Replace the default values if "ALL" is selected.
+    if selected_countries == ["ALL"]:
+        selected_countries = countries
+    if selected_emissions == ["ALL"]:
+        selected_emissions = emission_columns
+
+    # Filter data by the selected year range and countries.
+    df_filtered = df[(df['year'] >= start_year) & (df['year'] <= end_year) &
+                     (df['country'].isin(selected_countries))]
+
+    if df_filtered.empty:
+        return {
+            "data": [],
+            "layout": {"title": "No data available for the selected options."}
+        }
+
+    # Reshape data: melt the selected emission columns while keeping 'year' and 'country'.
+    df_melt = df_filtered.melt(
+        id_vars=['year', 'country'],
+        value_vars=selected_emissions,
+        var_name='Emission Type',
+        value_name='Emission Value'
+    )
+
+    # Group the data by 'year' and 'country' to compute the average emission value per country-year.
+    df_avg = df_melt.groupby(['year', 'country'], as_index=False)['Emission Value'].mean()
+
+    # Create a line graph with separate lines for each country.
+    fig = px.line(
+        df_avg,
+        x='year',
+        y='Emission Value',
+        color='country',
+        markers=True,
+        title=f'Average Emissions from {start_year} to {end_year}'
+    )
+
+    # Adjust layout and set the x-axis range to match the selected year range.
+    fig.update_layout(
+        title=dict(
+            text=f'Average Emissions from {start_year} to {end_year}',
+            x=0.5,
+            xanchor='center',
+            pad=dict(t=0, b=0)
+        ),
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend=dict(itemclick='toggleothers'),
+        xaxis=dict(dtick=1),
+        height=800
+    )
+    fig.update_xaxes(range=[start_year, end_year])
+    return fig
+
+# Callback for the country dropdown with a stored previous value:
+# - If "ALL" is selected on its own, keep it.
+# - If "ALL" is selected along with individual countries, remove "ALL".
+# - Conversely, if "ALL" is clicked, clear out any individual selections.
+@app.callback(
+    [Output('country-dropdown', 'value'),
+     Output('country-store', 'data')],
+    [Input('country-dropdown', 'value'),
+     Input('country-store', 'data')]
+)
+def update_country_dropdown(selected, prev):
+    if selected is None:
+        selected = []
+    if prev is None:
+        prev = []
+    # Determine items that have been newly added.
+    added = [item for item in selected if item not in prev]
+    if "ALL" in added:
+        new_val = ["ALL"]
+    elif "ALL" in selected and any(item != "ALL" for item in added):
+        new_val = [item for item in selected if item != "ALL"]
+    else:
+        new_val = selected
+    return new_val, new_val
+
+# Callback for the emission dropdown with a stored previous value:
+# - If "ALL" is selected on its own, then clear other individual selections.
+# - If any individual emission is selected while "ALL" is active, remove "ALL".
+@app.callback(
+    [Output('emission-dropdown', 'value'),
+     Output('emission-store', 'data')],
+    [Input('emission-dropdown', 'value'),
+     Input('emission-store', 'data')]
+)
+def update_emission_dropdown(selected, prev):
+    if selected is None:
+        selected = []
+    if prev is None:
+        prev = []
+    # Determine newly added items.
+    added = [item for item in selected if item not in prev]
+    if "ALL" in added:
+        new_val = ["ALL"]
+    elif "ALL" in selected and any(item != "ALL" for item in added):
+        new_val = [item for item in selected if item != "ALL"]
+    else:
+        new_val = selected
+    return new_val, new_val
+
+if __name__ == '__main__':
+    app.run(debug=True)
